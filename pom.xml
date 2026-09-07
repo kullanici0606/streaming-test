@@ -56,6 +56,56 @@
           <scalaVersion>${scala.version}</scalaVersion>
         </configuration>
       </plugin>
+
+      <!--
+        Shade is here so that META-INF/services survives if this module is ever packaged
+        together with the connector (or with your app). ServicesResourceTransformer CONCATENATES
+        DataSourceRegister files instead of letting one overwrite the other; without it you lose
+        either "couchbase.analytics.streaming" or the connector's own formats, and the failure is
+        a silent "Failed to find data source" at runtime rather than a build error.
+
+        With every dependency at <scope>provided</scope> (the default here) there is only one
+        service file, so this is effectively a passthrough and you still get a thin jar.
+        Flip the spark-connector dependency above to <scope>compile</scope> if you want a single
+        jar carrying both the connector and this module.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <shadedArtifactAttached>false</shadedArtifactAttached>
+              <transformers>
+                <!-- The one that matters: merges META-INF/services/* across all jars. -->
+                <transformer
+                  implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <!-- Signed jars (several Couchbase/Netty artifacts are signed) fail with
+                         "Invalid signature file digest" once repackaged. -->
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>module-info.class</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <!-- Deliberately NOT using <minimizeJar>: it prunes classes that are only ever
+                   reached reflectively, which is exactly how ServiceLoader loads the provider. -->
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
     </plugins>
   </build>
 </project>
