@@ -48,15 +48,17 @@ class StreamingAnalyticsPartitionReader(
     schema: StructType,
     conf: CouchbaseConfig,
     readConfig: AnalyticsReadConfig,
+    streamingConfig: StreamingAnalyticsReadConfig,
     filters: Array[Filter],
     aggregations: Option[Aggregation]
 ) extends PartitionReader[InternalRow]
     with Logging {
 
   /** Upper bound on rows held in memory: outstanding reactive demand plus whatever is sitting
-    * in the hand-off queue. This is the whole point of the class -- keep it small.
+    * in the hand-off queue. This is the whole point of the class -- keep it small. Set with the
+    * `queueSize` read option; see StreamingAnalyticsOptions.
     */
-  private val DesiredItemsInQueue = 30
+  private val DesiredItemsInQueue = streamingConfig.queueSize
 
   private val parser       = CouchbaseJsonUtils.jsonParser(schema)
   private val createParser = CouchbaseJsonUtils.createParser()
@@ -135,13 +137,7 @@ class StreamingAnalyticsPartitionReader(
       // Aggregates like MIN, MAX etc come back as $1, $2 ... so they need to be replaced with
       // their original field names from the schema for the JSON parser to pick them up.
       if (hasAggregateFields) {
-        var idx = 1
-        schema.fields.foreach(field => {
-          if (!groupByColumns.contains(field.name)) {
-            row = row.replace("$" + idx, field.name)
-            idx = idx + 1
-          }
-        })
+        row = StreamingAnalyticsPartitionReader.renameAggregatePlaceholders(row, schema, groupByColumns)
       }
       val parsed = parser.parse(row, createParser, UTF8String.fromString).toSeq
       if (parsed.size != 1) {
@@ -260,4 +256,31 @@ class StreamingAnalyticsPartitionReader(
 
   override def currentMetricsValues(): Array[CustomTaskMetric] =
     AnalyticsPartitionReader.currentMetricsValues(Option(metaData.get()).map(_.metrics))
+}
+
+object StreamingAnalyticsPartitionReader {
+
+  /** Rewrites the `$1`, `$2`, ... placeholder keys that Analytics assigns to unnamed aggregate
+    * columns back to the field names from the Spark schema. Placeholders are numbered in schema
+    * order, skipping group-by columns, which keep their own names.
+    *
+    * Replacement runs from the highest index down. The stock connector replaces `$1` first,
+    * which also rewrites the prefix of `$10`, `$11`, ... and silently corrupts every aggregate
+    * beyond the ninth. Note this is still a plain text substitution: a `$N` that occurs inside a
+    * string value is rewritten too.
+    */
+  def renameAggregatePlaceholders(
+      row: String,
+      schema: StructType,
+      groupByColumns: Seq[String]
+  ): String = {
+    val placeholderNames = schema.fields.map(_.name).filterNot(groupByColumns.contains)
+    var out              = row
+    var idx              = placeholderNames.length
+    while (idx >= 1) {
+      out = out.replace("$" + idx, placeholderNames(idx - 1))
+      idx -= 1
+    }
+    out
+  }
 }

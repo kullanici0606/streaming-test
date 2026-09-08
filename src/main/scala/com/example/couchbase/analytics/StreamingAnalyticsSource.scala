@@ -43,22 +43,32 @@ class StreamingAnalyticsTableProvider extends AnalyticsTableProvider {
       partitioning: Array[Transform],
       properties: util.Map[String, String]
   ): Table =
-    new StreamingAnalyticsTable(schema, partitioning, properties, readConfig(properties))
+    new StreamingAnalyticsTable(
+      schema,
+      partitioning,
+      properties,
+      readConfig(properties),
+      StreamingAnalyticsReadConfig(properties)
+    )
 }
 
 class StreamingAnalyticsTable(
     schema: StructType,
     partitioning: Array[Transform],
     properties: util.Map[String, String],
-    readConfig: AnalyticsReadConfig
+    readConfig: AnalyticsReadConfig,
+    streamingConfig: StreamingAnalyticsReadConfig
 ) extends AnalyticsTable(schema, partitioning, properties, readConfig) {
 
   override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder =
-    new StreamingAnalyticsScanBuilder(schema, readConfig)
+    new StreamingAnalyticsScanBuilder(schema, readConfig, streamingConfig)
 }
 
-class StreamingAnalyticsScanBuilder(schema: StructType, readConfig: AnalyticsReadConfig)
-    extends ScanBuilder
+class StreamingAnalyticsScanBuilder(
+    schema: StructType,
+    readConfig: AnalyticsReadConfig,
+    streamingConfig: StreamingAnalyticsReadConfig
+) extends ScanBuilder
     with SupportsPushDownFilters
     with SupportsPushDownRequiredColumns
     with SupportsPushDownAggregates {
@@ -68,7 +78,7 @@ class StreamingAnalyticsScanBuilder(schema: StructType, readConfig: AnalyticsRea
   private var aggregations: Option[Aggregation] = None
 
   override def build(): Scan =
-    new StreamingAnalyticsScan(finalSchema, readConfig, pushedFilter, aggregations)
+    new StreamingAnalyticsScan(finalSchema, readConfig, streamingConfig, pushedFilter, aggregations)
 
   override def pushFilters(filters: Array[Filter]): Array[Filter] = {
     pushedFilter = filters
@@ -115,6 +125,7 @@ class StreamingAnalyticsScanBuilder(schema: StructType, readConfig: AnalyticsRea
 class StreamingAnalyticsScan(
     schema: StructType,
     readConfig: AnalyticsReadConfig,
+    streamingConfig: StreamingAnalyticsReadConfig,
     filters: Array[Filter],
     aggregations: Option[Aggregation]
 ) extends AnalyticsScan(schema, readConfig, filters, aggregations) {
@@ -123,25 +134,27 @@ class StreamingAnalyticsScan(
     CouchbaseConfig(SparkSession.active.sparkContext.getConf, readConfig.connectionIdentifier)
 
   override def toBatch: Batch =
-    new StreamingAnalyticsBatch(schema, conf, readConfig, filters, aggregations)
+    new StreamingAnalyticsBatch(schema, conf, readConfig, streamingConfig, filters, aggregations)
 }
 
 class StreamingAnalyticsBatch(
     schema: StructType,
     conf: CouchbaseConfig,
     readConfig: AnalyticsReadConfig,
+    streamingConfig: StreamingAnalyticsReadConfig,
     filters: Array[Filter],
     aggregations: Option[Aggregation]
 ) extends AnalyticsBatch(schema, conf, readConfig, filters, aggregations) {
 
   // planInputPartitions() is inherited: a single partition with analytics-node preferred locations.
   override def createReaderFactory(): PartitionReaderFactory =
-    new StreamingAnalyticsPartitionReaderFactory(conf, readConfig)
+    new StreamingAnalyticsPartitionReaderFactory(conf, readConfig, streamingConfig)
 }
 
 class StreamingAnalyticsPartitionReaderFactory(
     conf: CouchbaseConfig,
-    readConfig: AnalyticsReadConfig
+    readConfig: AnalyticsReadConfig,
+    streamingConfig: StreamingAnalyticsReadConfig
 ) extends PartitionReaderFactory {
 
   override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
@@ -150,6 +163,7 @@ class StreamingAnalyticsPartitionReaderFactory(
       part.schema,
       conf,
       readConfig,
+      streamingConfig,
       part.filters,
       part.aggregations
     )

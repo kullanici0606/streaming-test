@@ -23,7 +23,8 @@ before Spark sees row one — no amount of repartitioning or executor tuning hel
 `QueryPartitionReader` does not have this problem: Couchbase fixed it under **SPARKC-178** using
 the reactive SDK plus a bounded hand-off queue. The Analytics reader never got that treatment.
 This module applies the same fix, subscribing directly to the row flux so `request(n)` reaches
-the SDK's chunk parser. Steady state is `DesiredItemsInQueue` (30) rows in memory.
+the SDK's chunk parser. Steady state is `queueSize` (default 30) parsed rows plus the SDK's own
+256-row prefetch buffer in memory.
 
 ## Usage
 
@@ -41,6 +42,50 @@ Dataset<Row> df = spark.read()
 All options, filter/column/aggregate pushdown and schema inference behave exactly as the stock
 `couchbase.analytics` source — the plumbing subclasses the connector's own classes.
 
+One extra option:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `queueSize` | `30` | Upper bound on rows held per task: outstanding demand to the SDK plus rows already parsed and waiting for Spark. Must be a positive integer. |
+
+```java
+spark.read()
+    .format("couchbase.analytics.streaming")
+    .option("dataset", "my_dataset")
+    .option("queueSize", "1000")
+    .load();
+```
+
+### Choosing `queueSize`
+
+`queueSize` bounds memory, but because `next()` polls the hand-off queue with a 1 ms sleep it
+also caps throughput. When Spark drains the queue faster than the SDK thread fills it, each
+sleep cycle moves at most `queueSize` rows, so the ceiling is roughly `queueSize` × 1000 rows/s
+per task:
+
+| `queueSize` | Ceiling (rows/s) | 10M rows, best case |
+| --- | --- | --- |
+| 30 (default) | ~30k | ~5.5 min |
+| 256 | ~256k | ~40 s |
+| 1000 | ~1M | ~10 s |
+
+The ceiling only matters if the SDK-side JSON parsing is faster than it, which for documents of
+a few KB it usually is. Memory cost is `queueSize` parsed rows per task, roughly the JSON size
+times two to three, so 1000 rows of 2 KB documents is a few MB. Set it to a few hundred or
+1000 for large reads; there is nothing to gain above that.
+
+Two things `queueSize` does **not** control:
+
+- **Socket reads.** The SDK keeps its own 256-row prefetch buffer between the network and this
+  reader and re-requests from the socket as that buffer drains, so the network is paused and
+  resumed at ~256-row granularity whatever `queueSize` is.
+- **Parallelism.** The analytics batch plans a single input partition, so one task, one
+  connection and one parser thread handle the whole result. For very large datasets, split
+  the read into several `load()` calls with disjoint `filter` options and union them.
+
+The default is the value the stock `QueryPartitionReader` uses. It is kept for compatibility
+and is too low for multi-million-row reads.
+
 ## Build & deploy
 
 ```bash
@@ -57,6 +102,7 @@ match your deployment.
 | --- | --- |
 | `StreamingAnalyticsPartitionReader.scala` | the reader — reactive subscribe + bounded queue |
 | `StreamingAnalyticsSource.scala` | DSv2 wiring: TableProvider → Table → ScanBuilder → Scan → Batch → ReaderFactory |
+| `StreamingAnalyticsReadConfig.scala` | parses the module's own read options (`queueSize`) |
 | `META-INF/services/org.apache.spark.sql.sources.DataSourceRegister` | registers the format name |
 
 Everything in the wiring is a thin subclass of the connector's classes except
@@ -69,6 +115,10 @@ pushdown state (`finalSchema`, `pushedFilter`, `aggregations`) in private fields
   (LIMIT, task kill, downstream failure) leaves the analytics request running server-side.
 - Metrics (`currentMetricsValues`) are populated from the reactive `meta` mono on completion, so
   they appear once the partition finishes rather than up front.
+- Aggregate placeholder renaming (`$1`, `$2`, ...) runs from the highest index down. The stock
+  reader replaces `$1` first, which also rewrites the prefix of `$10`, `$11`, ... and returns null
+  for every pushed-down aggregate beyond the ninth. Covered by `RenameAggregatePlaceholdersSpec`
+  (`mvn test`).
 
 ## Verification status
 
