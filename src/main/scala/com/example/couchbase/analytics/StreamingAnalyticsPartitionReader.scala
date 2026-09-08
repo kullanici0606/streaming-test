@@ -172,10 +172,17 @@ class StreamingAnalyticsPartitionReader(
         throw error.get()
       }
 
+      // Read the completion flag BEFORE peeking. Reactive Streams orders every onNext before
+      // onComplete, and isComplete is set inside onComplete after the last queue.add, so a
+      // true read here guarantees the following peek sees every row. Peeking first opens a
+      // window where the SDK thread adds the final row and completes between the two reads,
+      // and that row is silently dropped. The stock QueryPartitionReader has that bug.
+      val complete = isComplete.get
+
       if (queue.peek() != null) {
         isDone = true
         hasItem = true
-      } else if (isComplete.get) {
+      } else if (complete) {
         isDone = true
       } else {
         Thread.sleep(1)
